@@ -16,10 +16,12 @@ announcer.
   - `bot.py` — always-on bot: welcomes members, answers questions via the
     real agentty agent over ACP (`/ask`, @mention, or DM), `/docs` `/install`
     `/repo` `/release` `/issue`, FAQ auto-replies, and #help auto-threading.
-  - `setup_github_to_discord.py` — one-shot: mirrors ALL repo activity (push,
-    issues, PRs, reviews, releases, stars, forks, branches/tags, discussions)
-    into a `#github` channel via GitHub's native webhook → Discord's `/github`
-    adapter. Zero hosting, idempotent. Needs `gh` authed as a repo admin.
+  - `setup_github_to_discord.py` — one-shot: provisions the per-type activity
+    channels + webhooks (`#commits`, `#activity`, `#releases-feed`, `#stars`)
+    and prints the `gh secret set` commands. Idempotent. The actual routing
+    lives in `agentty`'s `.github/workflows/discord-activity.yml`, which
+    forwards each event to the matching channel via Discord's native `/github`
+    adapter — so every event still renders natively, just split by type.
   - `acp_brain.py` — the bot's brain: drives `agentty acp` over stdio to answer
     questions with the real agent (read-only; all tool permissions auto-denied).
   - `discord-copy.md` — all server text in one place.
@@ -42,12 +44,19 @@ python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 
 ### Automating the repo → Discord
 
-`setup_github_to_discord.py` points GitHub's built-in repository webhook at
-Discord's native `/github` endpoint, so **every** repo event renders in a
-`#github` channel automatically — no server, no per-event code. Re-run it any
-time; it's idempotent (reuses the channel/webhook and replaces the repo hook).
-The curated `discord-release.yml` workflow still posts a prettier release embed
-to `#announcements`.
+Repo activity is **split by type** across dedicated channels:
+
+- `#commits` — pushes
+- `#activity` — issues, PRs, reviews, discussions (+ comments)
+- `#releases-feed` — releases, tag/branch create & delete
+- `#stars` — stars & forks
+
+Run `setup_github_to_discord.py` to create the channels + webhooks (idempotent),
+then run the printed `gh secret set` commands in the agentty repo. The
+`discord-activity.yml` workflow there forwards each event's raw payload to the
+right channel's Discord `/github` endpoint, so Discord renders every event
+natively — just in the right channel. The curated `discord-release.yml` workflow
+still posts a prettier release embed to `#announcements`.
 
 See [`bot/README.md`](bot/README.md) for the full walkthrough (creating the bot,
 getting the token, deploying).
