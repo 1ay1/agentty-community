@@ -47,7 +47,7 @@ python3 -m venv .venv && .venv/bin/python -m pip install -r requirements.txt
 Repo activity is **split by type** across dedicated channels:
 
 - `#commits` — pushes
-- `#activity` — issues, PRs, reviews, discussions (+ comments)
+- `#activity` — issues, PRs, reviews (+ comments)
 - `#releases-feed` — releases, tag/branch create & delete
 - `#stars` — stars & forks
 
