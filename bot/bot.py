@@ -857,6 +857,13 @@ async def memory_loop() -> None:
             await sync_github()
         except Exception as exc:
             print(f"memory github sync: {exc}")
+        try:
+            p = await asyncio.create_subprocess_exec(
+                "git", "-C", PUBLIC_WS, "pull", "-q", "--ff-only",
+                stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+            await asyncio.wait_for(p.wait(), 120)
+        except Exception as exc:
+            print(f"public clone pull: {exc}")
         await asyncio.sleep(1800)
 
 
