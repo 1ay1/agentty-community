@@ -12,11 +12,12 @@ This script only provisions the Discord side (idempotent): channels + webhooks.
 It then prints `gh secret set …` commands to wire the workflow. Run those with
 `gh` authed as an agentty-repo admin.
 
-Channels:
-  #commits        <- push
-  #activity       <- issues, PRs, reviews, discussions (+comments)
-  #releases-feed  <- release, tag/branch create & delete
-  #stars          <- star, fork
+Channel: #github (public, read-only) gets four webhooks, one per secret:
+  DISCORD_WH_COMMITS   <- push
+  DISCORD_WH_ACTIVITY  <- issues, PRs, reviews, discussions (+comments)
+  DISCORD_WH_RELEASES  <- release, tag/branch create & delete
+  DISCORD_WH_STARS     <- star, fork
+(#releases gets one clean card per release from the bot, not from webhooks.)
 
 Requirements: bot/.env with DISCORD_BOT_TOKEN + DISCORD_GUILD_ID (Manage
 Webhooks + Manage Channels perms).
@@ -34,17 +35,12 @@ GUILD_ID = os.environ.get("DISCORD_GUILD_ID", "")
 TOKEN = os.environ.get("DISCORD_BOT_TOKEN", "")
 UA = "DiscordBot (https://agentty.org, 1.0)"
 
-# channel name -> (topic, GitHub Actions secret name)
-CHANNELS = {
-    "commits":       ("Pushes & commits from github.com/1ay1/agentty (auto).",
-                      "DISCORD_WH_COMMITS"),
-    "activity":      ("Issues, PRs, reviews & discussions from 1ay1/agentty (auto).",
-                      "DISCORD_WH_ACTIVITY"),
-    "releases-feed": ("Published releases & tags from 1ay1/agentty (auto).",
-                      "DISCORD_WH_RELEASES"),
-    "stars":         ("New stars & forks for 1ay1/agentty (auto).",
-                      "DISCORD_WH_STARS"),
-}
+# All four GitHub Actions secrets point at webhooks in ONE public #github
+# channel (the workflow still routes by type, so splitting again later is just
+# a matter of moving a webhook). channel name -> topic, [secret names]
+GITHUB_CHANNEL = "github"
+GITHUB_TOPIC = "Live feed of agentty-org/agentty — commits, issues, PRs, reviews, stars & forks."
+SECRETS = ["DISCORD_WH_COMMITS", "DISCORD_WH_ACTIVITY", "DISCORD_WH_RELEASES", "DISCORD_WH_STARS"]
 
 
 def _load_dotenv(path: str = ".env") -> None:
@@ -81,11 +77,11 @@ def ensure_channel(existing: dict, name: str, topic: str) -> str:
     return ch["id"]
 
 
-def ensure_webhook(channel_id: str) -> str:
+def ensure_webhook(channel_id: str, name: str) -> str:
     whs = api(f"/channels/{channel_id}/webhooks")
-    wh = next((w for w in whs if w.get("name") == "gh"), None)
+    wh = next((w for w in whs if w.get("name") == name), None)
     if not wh:
-        wh = api(f"/channels/{channel_id}/webhooks", "POST", {"name": "gh"})
+        wh = api(f"/channels/{channel_id}/webhooks", "POST", {"name": name})
     return f"https://discord.com/api/webhooks/{wh['id']}/{wh['token']}"
 
 
@@ -100,21 +96,21 @@ def main() -> None:
     existing = {c["name"]: c for c in api(f"/guilds/{GUILD_ID}/channels")
                 if c.get("type") == 0}
 
-    print("→ Ensuring channels + webhooks …\n")
+    print("→ Ensuring #github + webhooks …\n")
+    cid = ensure_channel(existing, GITHUB_CHANNEL, GITHUB_TOPIC)
     secret_cmds = []
-    for name, (topic, secret) in CHANNELS.items():
-        cid = ensure_channel(existing, name, topic)
-        url = ensure_webhook(cid)
-        print(f"  #{name:14} {cid}")
-        secret_cmds.append(f"gh secret set {secret} -b '{url}'")
+    for secret in SECRETS:
+        url = ensure_webhook(cid, "gh-" + secret.removeprefix("DISCORD_WH_").lower())
+        print(f"  #{GITHUB_CHANNEL} {cid}  webhook {secret}")
+        secret_cmds.append(f"gh secret set {secret} -R agentty-org/agentty -b '{url}'")
 
     print("\n✅ Discord side ready. Now wire the routing workflow by running "
           "these in the agentty repo (gh authed as a repo admin):\n")
     print("cd ~/projects/agentty")
     for cmd in secret_cmds:
         print(cmd)
-    print("\nThe workflow .github/workflows/discord-activity.yml then routes "
-          "each event to the right channel.")
+    print("\nThe workflow .github/workflows/discord-activity.yml then forwards "
+          "every event to #github.")
 
 
 if __name__ == "__main__":

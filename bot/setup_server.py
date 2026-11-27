@@ -5,9 +5,8 @@ Given a bot token + guild (server) ID in a local .env, this configures the whole
 server via the Discord REST API:
 
   • sets server name, icon, banner, and description
-  • deletes the default channels
-  • creates the category + channel layout (with topics)
-  • posts the #read-me-first intro and rules
+  • creates the small category + channel layout (with topics); INFO is read-only
+  • posts the #start-here intro
   • creates a permanent invite and prints it
 
 Run it ONCE. It's idempotent: channels that already exist (matched by name) are
@@ -61,57 +60,45 @@ ICON_FILE = BRAND / "agentty-icon.png"
 BANNER_FILE = BRAND / "agentty-server-banner.png"
 
 # ── channel layout ──────────────────────────────────────────────────────────
-# (category, [(channel, topic), ...])
+# (category, [(channel, topic), ...]). Kept small on purpose: one place where
+# everything happens (#campfire). Add channels only when it gets too busy.
 LAYOUT = [
     ("📢 INFO", [
-        ("announcements", "Releases and news. github.com/1ay1/agentty"),
-        ("read-me-first", "Start here — what agentty is and how to install it."),
-        ("rules", "Community rules. Read before posting."),
-        ("releases", "Automated release notes from GitHub."),
+        ("start-here", "What agentty is, where things live, and how to ask the bot."),
+        ("releases", "Every agentty release, the moment it drops. 🚀"),
+        ("github", "Live feed of agentty-org/agentty — commits, issues, PRs, reviews, stars & forks."),
     ]),
-    ("💬 COMMUNITY", [
-        ("general", "General chat about agentty."),
-        ("help", "Stuck? Ask here — each question gets its own thread. Include OS + steps."),
-        ("faq", "Frequently asked questions. Check here before #help."),
-        ("bug-reports", "Report bugs. Best to also open a GitHub issue."),
-        ("feature-requests", "Ideas and requests for agentty."),
-        ("showcase", "Show off cool sessions, workflows, and setups."),
-        ("off-topic", "Anything not about agentty."),
+    ("🔥 CAMPFIRE", [
+        ("campfire", "The town square — chat, ideas, feedback, hot takes, show-and-tell. When in doubt, post here. 🔥"),
+        ("help", "Stuck? Ask here — include your OS, agentty version, and what you ran."),
+        ("bugs", "Something broke? Post it here. Right-click a message → Apps → Send to GitHub issue."),
     ]),
 ]
 
-READ_ME_FIRST = (
-    "**agentty** is a native terminal coding agent — one fast binary, no runtime. "
-    "It brings a flagship model into your terminal with local RAG over your "
-    "code/docs and Smart Mode routing that learns your repo.\n\n"
-    "📖 Docs: <https://agentty.org>\n"
-    "💻 Source: <https://github.com/1ay1/agentty>\n"
-    "⬇️ Install: <https://agentty.org/docs/installation>\n\n"
-    "New here? Say hi in #general, ask in #help, and drop cool sessions in "
-    "#showcase."
-)
+# Everyone can read INFO; only the bot/webhooks post there.
+INFO_CATEGORY = "📢 INFO"
+DENY_POST = (1 << 11) | (1 << 35) | (1 << 36) | (1 << 38)   # send, threads, send-in-threads
 
-RULES = (
-    "**Community rules**\n\n"
-    "**1. Be kind.** Assume good faith; no harassment, hate, or spam.\n"
-    "**2. Keep it on-topic** per channel — support in #help, ideas in #feature-requests.\n"
-    "**3. Search first.** Your question may already be in the docs or history.\n"
-    "**4. No piracy, malware, or illegal content.**\n"
-    "**5. English in the main channels** so everyone can follow.\n\n"
-    "Breaking these may get your messages or account removed."
-)
-
-FAQ_POST = (
-    "**Frequently asked questions**\n\n"
-    "**How do I install agentty?** → <https://agentty.org/docs/installation> — "
-    "prebuilt binaries for Linux/macOS/Windows, plus Homebrew, AUR, winget.\n\n"
-    "**Do I need an API key?** → On first launch, paste any provider key, use a "
-    "local Ollama model (no key), or sign in with Claude Pro/Max OAuth.\n\n"
-    "**What's Smart Mode?** → Routes each turn to the right model + effort and "
-    "learns your repo. <https://agentty.org/docs/smart-mode>\n\n"
-    "**Is the RAG local?** → Yes — fully local hybrid BM25 + embeddings, "
-    "reranked and GraphRAG-expanded. <https://agentty.org/docs/retrieval>\n\n"
-    "**Found a bug?** → Open an issue: <https://github.com/1ay1/agentty/issues/new/choose>"
+START_HERE = (
+    "## 🔥 welcome to the agentty campfire\n\n"
+    "**agentty** is a native terminal coding agent. It ships as one fast C++ "
+    "binary, has local RAG over your code and docs, and Smart Mode picks the "
+    "model and effort for each turn. A small, opinionated group hangs out here.\n\n"
+    "**Where things are**\n"
+    "{campfire} — **everything happens here.** Chat, ideas, feedback, hot takes, show-and-tell.\n"
+    "{help} — stuck? Post your question and you'll get a thread with an answer right away.\n"
+    "{bugs} — something broke? Include `agentty --version`, your OS, and your terminal.\n"
+    "{releases} — a ping each time a new version drops.\n"
+    "{github} — live feed of the repo: commits, issues, PRs, stars.\n\n"
+    "**The bot is agentty itself**, running against its own source. It reads the "
+    "code before it answers.\n"
+    "• @mention it, reply to it, DM it, or use `/ask`. Reply to its answer to keep going.\n"
+    "• Write `#123` in chat to show that issue or PR.\n"
+    "• Right-click any message → **Apps → Send to GitHub issue**.\n"
+    "• `/install` `/docs` `/release` `/stats` `/search` `/bug`\n\n"
+    "**One rule:** be kind. Assume good faith. That's it.\n\n"
+    "📖 <https://agentty.org/docs/> · 💻 <https://github.com/agentty-org/agentty> · "
+    "⬇️ `curl -fsSL https://agentty.org/install.sh | sh`"
 )
 
 
@@ -194,7 +181,8 @@ async def main() -> None:
         # 2) fetch existing channels so we're idempotent
         existing = {c["name"]: c for c in await d.get(f"/guilds/{guild}/channels")}
 
-        async def ensure(name, ctype, parent=None, topic=None):
+        async def ensure(name, ctype, parent=None, topic=None, locked=False):
+            lock = [{"id": guild, "type": 0, "allow": "0", "deny": str(DENY_POST)}]
             if name in existing:
                 ch = existing[name]
                 if topic and ch.get("topic") != topic and ctype == 0:
@@ -205,6 +193,8 @@ async def main() -> None:
                 body["parent_id"] = parent
             if topic:
                 body["topic"] = topic
+            if locked:
+                body["permission_overwrites"] = lock
             ch = await d.post(f"/guilds/{guild}/channels", body)
             existing[name] = ch
             print(f"  + {name}")
@@ -212,21 +202,13 @@ async def main() -> None:
 
         # 3) build categories + channels
         print("→ Creating channels …")
-        first_text = None
-        readme = None
-        rules_ch = None
-        faq_ch = None
+        made: dict[str, dict] = {}
         for cat_name, channels in LAYOUT:
-            cat = await ensure(cat_name, 4)  # 4 = category
+            locked = cat_name == INFO_CATEGORY
+            cat = await ensure(cat_name, 4, locked=locked)  # 4 = category
             for ch_name, topic in channels:
-                ch = await ensure(ch_name, 0, parent=cat["id"], topic=topic)  # 0 = text
-                first_text = first_text or ch
-                if ch_name == "read-me-first":
-                    readme = ch
-                elif ch_name == "rules":
-                    rules_ch = ch
-                elif ch_name == "faq":
-                    faq_ch = ch
+                made[ch_name] = await ensure(ch_name, 0, parent=cat["id"], topic=topic,
+                                             locked=locked)  # 0 = text
 
         # 4) seed content (only into channels that look empty)
         async def seed(ch, content, label):
@@ -237,12 +219,13 @@ async def main() -> None:
                 print(f"→ Posting {label} …")
                 await d.post(f"/channels/{ch['id']}/messages", {"content": content})
 
-        await seed(readme, READ_ME_FIRST, "#read-me-first intro")
-        await seed(rules_ch, RULES, "#rules")
-        await seed(faq_ch, FAQ_POST, "#faq")
+        await seed(made.get("start-here"),
+                   START_HERE.format(**{k: f"<#{v['id']}>" for k, v in made.items()
+                                        if k in ("campfire", "help", "bugs", "releases", "github")}),
+                   "#start-here")
 
         # 5) permanent invite
-        target = first_text or next(iter(existing.values()))
+        target = made.get("start-here") or next(iter(existing.values()))
         print("→ Creating a permanent invite …")
         inv = await d.post(f"/channels/{target['id']}/invites",
                            {"max_age": 0, "max_uses": 0, "unique": False})
