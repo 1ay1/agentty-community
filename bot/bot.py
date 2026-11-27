@@ -37,7 +37,8 @@ from urllib.parse import quote
 import discord
 from discord import app_commands
 
-from acp_brain import AcpBrain, ACP_WORKSPACE, ACP_MODEL, ACP_SMART_MODEL
+from acp_brain import (AcpBrain, ACP_WORKSPACE, ACP_MODEL, ACP_SMART_MODEL,
+                       PUBLIC_PREAMBLE, PUBLIC_REMINDER)
 from gh import GitHub, REPO
 from memory import Memory, render_hits
 
@@ -75,7 +76,7 @@ WELCOME_DM = (
     "Welcome to the **agentty** campfire \U0001f525\n\n"
     "It's a small room of people who care a lot about their tools — say hi in "
     "**#campfire**, that's where everything happens.\n\n"
-    "\u2022 Ask me anything: @mention me, reply to me, or DM me here. I read the "
+    "\u2022 Ask me anything about agentty: @mention me in #campfire or post in #help. I read the "
     "real agentty source before answering.\n"
     f"\u2022 Docs: <{DOCS_URL}>  \u2022 Install: <{INSTALL_URL}>  \u2022 Source: <{REPO_URL}>"
 )
@@ -117,9 +118,28 @@ class State:
 
 
 state = State(STATE_PATH)
+# Owner brain: your real agentty home (memory, settings) + your working tree.
 brain = AcpBrain()
+# Public brain: a clean clone of the public repo + an isolated AGENTTY_HOME
+# (login only — none of the owner's memory, threads or other projects), and a
+# framing that scopes it to agentty. Same models, same grounding.
+PUBLIC_WS = os.environ.get("PUBLIC_WORKSPACE", str(Path.home() / ".cache/agentty-bot/src"))
+PUBLIC_HOME = os.environ.get("PUBLIC_AGENTTY_HOME", str(Path.home() / ".cache/agentty-bot/home"))
+public_brain = AcpBrain(workspace=PUBLIC_WS, home=PUBLIC_HOME,
+                        preamble=PUBLIC_PREAMBLE, reminder=PUBLIC_REMINDER)
+
+# Public usage budget (owner is unlimited).
+USER_PER_HOUR = int(os.environ.get("PUBLIC_ASKS_PER_HOUR", "10"))
+USER_PER_DAY = int(os.environ.get("PUBLIC_ASKS_PER_DAY", "30"))
+SMART_PER_DAY = int(os.environ.get("PUBLIC_SMART_PER_DAY", "8"))
+SERVER_PER_DAY = int(os.environ.get("PUBLIC_ASKS_SERVER_DAY", "150"))
+MAX_PUBLIC_QUESTION = 1500
 github = GitHub()
 memory = Memory()
+
+
+def brain_for(user: discord.abc.User) -> AcpBrain:
+    return brain if is_owner(user) else public_brain
 
 
 # ---------------------------------------------------------------------------
@@ -336,15 +356,16 @@ def remember_answer(msg_id: int, key: str, question: str) -> None:
         answers.popitem(last=False)
 
 
-def touch_convo(key: str) -> None:
+def touch_convo(key: str, b: "AcpBrain") -> None:
     convos[key] = time.monotonic()
     convos.move_to_end(key)
     while len(convos) > MAX_CONVOS:
         old, _ = convos.popitem(last=False)
-        try:
-            brain.reset(old)
-        except Exception:
-            pass
+        for x in (brain, public_brain):
+            try:
+                x.reset(old)
+            except Exception:
+                pass
 
 
 async def _safe_edit(msg: discord.Message, **kw) -> None:
@@ -381,7 +402,11 @@ async def stream_answer(question: str, *, channel: discord.abc.Messageable,
         st["tool"] = title
         st["dirty"] = True
 
-    busy = brain._lock.locked()
+    b = brain_for(author)
+    if not is_owner(author):
+        key = "pub:" + key       # never share a session with the owner brain
+        record_usage(author.id, model or ACP_MODEL)
+    busy = b._lock.locked()
     first = "-# \u23f3 queued behind another question…" if busy else "-# \U0001f9e0 thinking…"
     if reply_to is not None:
         msg = await reply_to.reply(first, mention_author=False)
@@ -409,8 +434,8 @@ async def stream_answer(question: str, *, channel: discord.abc.Messageable,
     t0 = time.monotonic()
     try:
         async with channel.typing():
-            answer = await brain.ask(question, on_update=on_update, on_tool=on_tool,
-                                     convo_key=key, model=model)
+            answer = await b.ask(question, on_update=on_update, on_tool=on_tool,
+                                 convo_key=key, model=model)
     except Exception as exc:
         pump_task.cancel()
         await _safe_edit(msg, content=(
@@ -419,7 +444,7 @@ async def stream_answer(question: str, *, channel: discord.abc.Messageable,
         return
     finally:
         pump_task.cancel()
-    touch_convo(key)
+    touch_convo(key, b)
 
     answer = (answer or "").strip()
     if not answer:
@@ -531,7 +556,9 @@ async def with_context(message: discord.Message, question: str, key: str) -> str
     (pulse, GitHub events, joins). Only messages the session hasn't seen yet
     are added."""
     ch = message.channel
-    if key not in brain._sessions:          # fresh/retired session: start over
+    b = brain_for(message.author)
+    skey = key if b is brain else "pub:" + key
+    if skey not in b._sessions:             # fresh/retired session: start over
         ctx_seen.pop(key, None)
     seen = ctx_seen.get(key)
     ctx_seen[key] = message.id
@@ -621,11 +648,13 @@ _SMART_HINT = re.compile(
 
 
 def pick_model(message: discord.Message, question: str, key: str) -> str:
-    sid = brain._sessions.get(key)
-    if sid and brain._model.get(sid) == ACP_SMART_MODEL:
-        return ACP_SMART_MODEL
     if is_owner(message.author):
         return ACP_SMART_MODEL
+    sid = public_brain._sessions.get("pub:" + key)
+    if sid and public_brain._model.get(sid) == ACP_SMART_MODEL:
+        return ACP_SMART_MODEL
+    if not usage_ok(message.author.id, smart=True)[0]:
+        return ACP_MODEL                # smart budget spent today: still answer, cheaper
     q = question.strip()
     if len(q) > 220 or "```" in q or _SMART_HINT.search(q) or message.attachments:
         return ACP_SMART_MODEL
@@ -633,6 +662,75 @@ def pick_model(message: discord.Message, question: str, key: str) -> str:
             and message.reference.resolved.author.id != client.user.id:
         return ACP_SMART_MODEL          # "@agentty is this right?" on someone's message
     return ACP_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Public gate: agentty-only, rate-limited. Free local checks run BEFORE any
+# tokens are spent; the scoped framing is the second line of defence.
+# ---------------------------------------------------------------------------
+
+_usage: dict[int, list[tuple[float, bool]]] = {}     # user -> [(time, smart)]
+_server_day: list[float] = []
+
+_ON_TOPIC = re.compile(
+    r"agentty|agent|install|update|upgrade|config|setting|provider|model|claude|"
+    r"openai|gpt|gemini|ollama|copilot|api ?key|oauth|login|token|smart ?mode|rag|"
+    r"retriev|index|sandbox|acp|mcp|zed|jetbrains|skill|plugin|hook|profile|thread|"
+    r"session|subagent|tool|grep|terminal|tmux|ssh|airgap|keybind|shortcut|ctrl|"
+    r"theme|ui|screen|scroll|paste|clipboard|release|version|changelog|bug|crash|"
+    r"error|issue|pr\b|github|discord|build|cmake|compile|windows|mac|linux|arch|"
+    r"brew|winget|scoop|aur|docs?\b|feature|roadmap|context|compact|cost|price|"
+    r"usage|prompt|workspace|permission|fork|resume|memory|remember", re.I)
+_OFF_TOPIC = re.compile(
+    r"\b(write (me )?(an? )?(essay|poem|story|song|letter|cover letter|email|blog)|"
+    r"translate|homework|solve (this|for)|integral|derivative|recipe|horoscope|"
+    r"(write|build|make|code) (me )?(a|an) (website|app|game|script|bot|function)|"
+    r"ignore (all |your |previous )|system prompt|jailbreak|pretend (to be|you are)|"
+    r"act as|roleplay|role-play|you are now|dan mode)\b", re.I)
+
+REFUSAL = ("I'm agentty's helper here, so I stick to agentty questions \U0001f43a "
+           "For everything else, agentty itself does it in your terminal: "
+           "`curl -fsSL https://agentty.org/install.sh | sh`")
+
+
+def usage_ok(uid: int, smart: bool = False) -> tuple[bool, str]:
+    now = time.time()
+    rows = _usage.setdefault(uid, [])
+    rows[:] = [r for r in rows if now - r[0] < 86400]
+    _server_day[:] = [t for t in _server_day if now - t < 86400]
+    if smart:
+        return sum(1 for _, s in rows if s) < SMART_PER_DAY, ""
+    if len(_server_day) >= SERVER_PER_DAY:
+        return False, "I've hit today's question budget for the server. Back tomorrow \U0001f319 Docs: <" + DOCS_URL + ">"
+    if sum(1 for t, _ in rows if now - t < 3600) >= USER_PER_HOUR:
+        return False, "Easy, I need a breather. You've asked a lot this hour; try again in a bit \U0001f525"
+    if len(rows) >= USER_PER_DAY:
+        return False, "That's your question budget for today. Back tomorrow \U0001f319"
+    return True, ""
+
+
+def record_usage(uid: int, model: str) -> None:
+    _usage.setdefault(uid, []).append((time.time(), model == ACP_SMART_MODEL))
+    _server_day.append(time.time())
+
+
+async def public_gate(message: discord.Message, question: str, context_hint: str = "") -> bool:
+    """True if a non-owner may spend AI on this. Replies with the reason if not.
+    Owner always passes."""
+    if is_owner(message.author):
+        return True
+    ok, why = usage_ok(message.author.id)
+    if not ok:
+        await message.reply(why, mention_author=False)
+        return False
+    if len(question) > MAX_PUBLIC_QUESTION and "```" not in question:
+        await message.reply("That's a lot. Can you boil it down to the agentty part? "
+                            "(Logs are fine in a code block.)", mention_author=False)
+        return False
+    if _OFF_TOPIC.search(question) and not _ON_TOPIC.search(question):
+        await message.reply(REFUSAL, mention_author=False)
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1095,7 +1193,8 @@ async def on_ready() -> None:
         asyncio.create_task(coro)
     try:
         await brain._ensure_started()
-        print("agentty-bot brain: ACP agent ready")
+        await public_brain._ensure_started()
+        print("agentty-bot brain: ACP agents ready (owner + public)")
     except Exception as exc:
         print(f"agentty-bot brain: NOT ready ({exc}) — will retry on demand")
 
@@ -1201,6 +1300,8 @@ async def on_message(message: discord.Message) -> None:
 
     # #help: top-level posts get a thread + an answer.
     if chname == CH_HELP and not isinstance(ch, discord.Thread) and not replying_to_bot and question:
+        if not await public_gate(message, question):
+            return
         await handle_help_post(message)
         return
 
@@ -1215,6 +1316,8 @@ async def on_message(message: discord.Message) -> None:
         if ch.id in help_handoff:
             return
         if question:
+            if not await public_gate(message, question):
+                return
             key = f"t{ch.id}"
             model = pick_model(message, question, key)
             q = await with_context(message, question, key)
@@ -1223,6 +1326,13 @@ async def on_message(message: discord.Message) -> None:
         return
 
     if is_dm or mentioned or replying_to_bot:
+        # DMs are private AI: owner only. Everyone else asks in the open, where
+        # the community sees (and learns from) the answers.
+        if is_dm and not is_owner(message.author):
+            await message.reply(
+                "I answer agentty questions in the server, where everyone can learn from them: "
+                "@mention me in **#campfire** or post in **#help** \U0001f525", mention_author=False)
+            return
         if not question:
             await message.reply("Ask me anything about agentty \U0001f680 e.g. *how do I enable Smart "
                                 "Mode?* or *how does the local RAG work?*", mention_author=False)
@@ -1233,6 +1343,8 @@ async def on_message(message: discord.Message) -> None:
             return
         if message.attachments:
             question += "\n\n(Attached: " + ", ".join(a.filename for a in message.attachments[:5]) + ")"
+        if not await public_gate(message, question):
+            return
         key = convo_key_for(message)
         model = pick_model(message, question, key)
         question = await with_context(message, question, key)
@@ -1275,10 +1387,25 @@ DOCS = _docs_index()
 @tree.command(name="ask", description="Ask the agentty agent anything (it reads the real source)")
 @app_commands.describe(question="Your question about agentty")
 async def ask_cmd(interaction: discord.Interaction, question: str) -> None:
+    if not is_owner(interaction.user):
+        if interaction.guild is None:
+            await interaction.response.send_message(
+                "Ask in the server: `/ask` in **#campfire** or post in **#help** \U0001f525", ephemeral=True)
+            return
+        ok, why = usage_ok(interaction.user.id)
+        if not ok:
+            await interaction.response.send_message(why, ephemeral=True)
+            return
+        if (_OFF_TOPIC.search(question) and not _ON_TOPIC.search(question)) or len(question) > MAX_PUBLIC_QUESTION:
+            await interaction.response.send_message(REFUSAL, ephemeral=True)
+            return
     await interaction.response.send_message(f"**{interaction.user.display_name} asked:** {clip(question, 1800)}")
     q_msg = await interaction.original_response()
-    await stream_answer(question, channel=interaction.channel, reply_to=q_msg,
-                        key=f"m{q_msg.id}", author=interaction.user)
+    key = f"m{q_msg.id}"
+    smart = is_owner(interaction.user) or (bool(_SMART_HINT.search(question) or len(question) > 220)
+                                           and usage_ok(interaction.user.id, smart=True)[0])
+    await stream_answer(question, channel=interaction.channel, reply_to=q_msg, key=key,
+                        author=interaction.user, model=ACP_SMART_MODEL if smart else ACP_MODEL)
 
 
 @tree.command(name="docs", description="Find an agentty docs page")
@@ -1458,7 +1585,7 @@ async def notify_cmd(interaction: discord.Interaction, gh_mode: app_commands.Cho
 async def help_cmd(interaction: discord.Interaction) -> None:
     e = discord.Embed(title="agentty bot", color=BRAND, description=(
         "I'm agentty itself, running against its own source. I read the code before I answer.\n\n"
-        "**Ask:** @mention me, reply to me, DM me, or `/ask`. Reply to my answer to keep going.\n"
+        "**Ask:** @mention me, reply to me, or `/ask`, about anything agentty. Reply to my answer to keep going.\n"
         "**#help:** post a question and you get a thread with an answer right away.\n"
         "**GitHub:** write `#123` to show an issue, or right-click a message → Apps → "
         "*Send to GitHub issue*.\n\n"
