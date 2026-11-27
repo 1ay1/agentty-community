@@ -44,8 +44,11 @@ AGENTTY_BIN = os.environ.get("AGENTTY_BIN", "agentty")
 # read/grep/repo_map the ENTIRE codebase to ground its answers — and can touch
 # nothing outside it.
 ACP_WORKSPACE = os.environ.get("ACP_WORKSPACE", "/home/ayush/projects/agentty")
-# Answer model — Haiku: fast, cheap, and plenty smart for grounded Q&A.
+# Two tiers. FAST answers simple lookups and chatter; SMART takes anything that
+# needs judgement (debugging, "is he right?", design, multi-step reasoning) and
+# every owner conversation. Routing happens in the bot (free, local heuristics).
 ACP_MODEL = os.environ.get("ACP_MODEL", "claude-haiku-4-5")
+ACP_SMART_MODEL = os.environ.get("ACP_SMART_MODEL", "claude-sonnet-5-5")
 # Per-question wall-clock ceiling — generous, a real turn reads several files.
 ACP_TIMEOUT = float(os.environ.get("ACP_TIMEOUT", "180"))
 # When a warm session's context passes this fraction of the model window, we
@@ -57,45 +60,37 @@ ACP_CONTEXT_FILL = float(os.environ.get("ACP_CONTEXT_FILL", "0.80"))
 # code before answering — we WANT it to. Write/exec/net still prompt and this
 # client auto-denies those, so a Discord user can only ever make it read+reason.
 PREAMBLE = (
-    "You are the official agentty community assistant, answering a question in "
-    "the agentty Discord. agentty is a fast, native (C++23), single-binary "
-    "terminal coding agent with local hybrid RAG, Smart Mode model routing, "
-    "OS sandboxing, ACP/MCP support, and skills.\n\n"
-    "IMPORTANT: your working directory IS the complete agentty source tree. Use "
-    "your tools freely and thoroughly — grep, read, repo_map, find_definition, "
-    "glob — to ground EVERY factual claim in the ACTUAL code, docs (docs/, "
-    "docs/website/), README, and CHANGELOG before you answer. Never guess about "
-    "a flag, a default, a file path, or how a feature works when you can read "
-    "it in seconds. Prefer the real source of truth over memory. You may answer "
-    "ANY question about agentty in full depth — architecture, internals, CLI "
-    "usage, config, building, providers, tools — as well as general coding "
-    "questions.\n\n"
-    "Answer style: write for a Discord chat message. Be direct and genuinely "
-    "helpful. Use compact GitHub-flavoured markdown and fenced code blocks for "
-    "commands/code. Cite concrete file paths (e.g. `src/acp/server.cpp`) and "
-    "links to https://agentty.org/docs when useful. Length: as long as the "
-    "question needs and no longer — a one-liner for a simple question, a full "
-    "walkthrough for a deep one. Do NOT edit files or run shell commands; only "
-    "read, reason, and explain. If after checking you still don't know, say so "
-    "honestly and point to the docs.\n\n"
-    "BE TOKEN-FRUGAL — this runs on a metered API. Use the CHEAPEST path that "
-    "answers correctly: prefer `search_docs` and a single targeted `grep` (with "
-    "a tight glob/path) or `repo_map` over broad exploration. Read only the "
-    "specific slice of a file you need, never whole large files. Do NOT open "
-    "files you don't need, don't re-read, and don't run a tool 'just to be "
-    "sure'. The moment you have enough to answer, STOP and answer. Aim to "
-    "resolve most questions in 0–3 tool calls. Keep the answer as short as the "
-    "question allows (a sentence or two for simple asks; only go long when the "
-    "question genuinely needs depth), and never pad.\n\n"
-    "User question:\n"
+    "You are agentty, living in the agentty Discord as a member of the team — "
+    "not a generic chatbot. agentty is a native C++23 single-binary terminal "
+    "coding agent (local hybrid RAG, Smart Mode routing, OS sandbox, ACP/MCP, "
+    "skills). Your working directory is its complete source tree (src/, "
+    "include/, docs/, docs/website/, CHANGELOG.md).\n\n"
+    "Every message comes with what you need to understand it, in this order: "
+    "the recent conversation, the messages it links or replies to, and "
+    "COMMUNITY MEMORY — relevant snippets retrieved from the whole Discord and "
+    "GitHub history (issues, PRs, commits, releases). READ THEM FIRST. Resolve "
+    "\"he\", \"that bug\", \"is it right\" from them like a teammate who was in "
+    "the room. Never ask for clarification when the answer is in the context; "
+    "if it's genuinely ambiguous, state your best reading and answer it.\n\n"
+    "Think like a senior maintainer: when someone reports a bug or makes a "
+    "claim about agentty, verify it in the code and give a verdict (true / "
+    "false / partly, why, where — file:line), the likely cause, and the fix or "
+    "workaround. Link the relevant issue/commit/release if memory has one. Say "
+    "if it's already fixed (check CHANGELOG.md / memory).\n\n"
+    "Tokens are metered, so be surgical, not lazy: the context usually already "
+    "answers 'what/who/when'; use tools only for what it can't — targeted grep "
+    "with a tight path, read only the needed slice, stop as soon as you know. "
+    "Most answers need 0–4 tool calls. Read-only: never edit or run commands.\n\n"
+    "Write for Discord: direct, specific, no filler, no preamble, no 'great "
+    "question'. Compact markdown, fenced code for commands. As short as the "
+    "question allows; go deep only when it needs it.\n\n"
 )
 
 # Sent instead of the full PREAMBLE on FOLLOW-UP turns of a warm session — the
 # framing already lives in the session's history, so we don't re-pay for it.
 REMINDER = (
-    "(Same agentty-community-assistant rules as before: ground answers in the "
-    "real code with minimal tool calls, be token-frugal, Discord-friendly "
-    "markdown.)\n\nUser question:\n"
+    "(Same rules: context first, verify claims in code, surgical tool use, "
+    "Discord-friendly.)\n\n"
 )
 
 
@@ -161,6 +156,8 @@ class AcpBrain:
         self._sid_key: dict[str, str] = {}
         # Latest context fill reported per session id, as (used, size).
         self._usage: dict[str, tuple[int, int]] = {}
+        # Model each session runs on (session id -> model id).
+        self._model: dict[str, str] = {}
         self._ready = False
 
     # ── process lifecycle ────────────────────────────────────────────────
@@ -353,7 +350,7 @@ class AcpBrain:
 
     # ── public API ───────────────────────────────────────────────────────
     async def ask(self, question: str, on_update=None, on_tool=None,
-                  convo_key: str = "global") -> str:
+                  convo_key: str = "global", model: str | None = None) -> str:
         """Ask the agent a question; return its answer text (may raise).
 
         ``on_update(str)`` — called with the growing answer as chunks stream in.
@@ -363,20 +360,35 @@ class AcpBrain:
                              prompt-cache-hot session (real memory); different
                              keys stay isolated. Use a Discord thread id for
                              per-thread memory, or "global" for one-off asks.
+        ``model``          — model id for this conversation (default ACP_MODEL).
+                             A different model than the session's opens a fresh
+                             session (switching mid-session would bust the
+                             prompt cache anyway).
         """
         question = question.strip()
         if not question:
             return ""
+        model = model or ACP_MODEL
         async with self._lock:
             await self._ensure_started()
             # Reuse this key's warm session if present; else open a fresh one.
             # First turn gets the full framing PREAMBLE; later turns get only a
             # tiny REMINDER (the framing already lives in cached history).
             sid = self._sessions.get(convo_key)
+            if sid is not None and self._model.get(sid) != model:
+                self._retire(sid)
+                sid = None
             if sid is None:
                 new = await self._request("session/new",
                                           {"cwd": ACP_WORKSPACE, "mcpServers": []})
                 sid = new["sessionId"]
+                if model != ACP_MODEL:
+                    try:
+                        await self._request("session/set_config_option", {
+                            "sessionId": sid, "configId": "model", "value": model})
+                    except Exception:
+                        model = ACP_MODEL       # not available: stay on default
+                self._model[sid] = model
                 self._sessions[convo_key] = sid
                 self._sid_key[sid] = convo_key
                 framing = PREAMBLE
@@ -388,13 +400,17 @@ class AcpBrain:
             if on_tool is not None:
                 self._tool_cbs[sid] = on_tool
             try:
-                await asyncio.wait_for(
+                res = await asyncio.wait_for(
                     self._request("session/prompt", {
                         "sessionId": sid,
                         "prompt": [{"type": "text", "text": framing + question}],
                     }),
                     timeout=ACP_TIMEOUT,
                 )
+                err = ((res or {}).get("_meta") or {}).get("error")
+                if err and not self._answer.get(sid):
+                    self._retire(sid)
+                    raise RuntimeError(err)
             except asyncio.TimeoutError:
                 try:
                     self._write({"jsonrpc": "2.0", "method": "session/cancel",
@@ -435,6 +451,7 @@ class AcpBrain:
         if key is not None and self._sessions.get(key) == sid:
             self._sessions.pop(key, None)
         self._usage.pop(sid, None)
+        self._model.pop(sid, None)
         self._answer.pop(sid, None)
         self._stream_cbs.pop(sid, None)
         self._tool_cbs.pop(sid, None)

@@ -37,8 +37,9 @@ from urllib.parse import quote
 import discord
 from discord import app_commands
 
-from acp_brain import AcpBrain, ACP_WORKSPACE
+from acp_brain import AcpBrain, ACP_WORKSPACE, ACP_MODEL, ACP_SMART_MODEL
 from gh import GitHub, REPO
+from memory import Memory, render_hits
 
 # ---------------------------------------------------------------------------
 # Config
@@ -118,6 +119,7 @@ class State:
 state = State(STATE_PATH)
 brain = AcpBrain()
 github = GitHub()
+memory = Memory()
 
 
 # ---------------------------------------------------------------------------
@@ -363,7 +365,7 @@ def feedback_view() -> discord.ui.View:
 
 async def stream_answer(question: str, *, channel: discord.abc.Messageable,
                         reply_to: discord.Message | None, key: str,
-                        author: discord.abc.User) -> None:
+                        author: discord.abc.User, model: str | None = None) -> None:
     """Ask the agent and live-edit ONE message as the answer streams in, with a
     subtext line showing what the agent is reading. Then settle into the final
     chunked answer with 👍/👎."""
@@ -408,7 +410,7 @@ async def stream_answer(question: str, *, channel: discord.abc.Messageable,
     try:
         async with channel.typing():
             answer = await brain.ask(question, on_update=on_update, on_tool=on_tool,
-                                     convo_key=key)
+                                     convo_key=key, model=model)
     except Exception as exc:
         pump_task.cancel()
         await _safe_edit(msg, content=(
@@ -497,16 +499,267 @@ def strip_mentions(text: str) -> str:
     return text.strip()
 
 
-async def with_reply_context(message: discord.Message, question: str) -> str:
-    """When someone replies to a HUMAN message and pings the bot ("@agentty is
-    this right?"), include the message being replied to."""
+# convo key -> id of the newest channel message its agent session has already
+# seen, so each turn only adds what's new (no re-paying for old transcript).
+ctx_seen: dict[str, int] = {}
+_FOOTER = re.compile(r"^-# .*$", re.M)
+_JUMP = re.compile(r"https://(?:\w+\.)?discord(?:app)?\.com/channels/\d+/(\d+)/(\d+)")
+
+
+def render_msg(m: discord.Message, per_msg: int = 1500) -> str:
+    """One chat message as plain text, including embeds (GitHub events, join
+    cards, release cards) so the agent sees what the humans see."""
+    me = client.user and m.author.id == client.user.id
+    who = "agentty (you)" if me else m.author.display_name
+    parts = [_FOOTER.sub("", m.content or "").strip()]
+    for e in m.embeds:
+        bits = [e.title or "", e.description or ""]
+        bits += [f"{f.name}: {f.value}" for f in e.fields]
+        if e.author and e.author.name:
+            bits.insert(0, f"[{e.author.name}]")
+        parts.append(" — ".join(b for b in bits if b))
+    if m.attachments:
+        parts.append("(attached: " + ", ".join(a.filename for a in m.attachments[:5]) + ")")
+    body = clip("\n".join(p for p in parts if p), per_msg)
+    return f"{who}: {body}" if body else ""
+
+
+async def with_context(message: discord.Message, question: str, key: str) -> str:
+    """Prefix the question with the recent conversation it lives in, so "is he
+    right?", "that bug" or "what about Windows?" resolve the way a human would
+    read them. In the owner's DM this includes the bot's own notifications
+    (pulse, GitHub events, joins). Only messages the session hasn't seen yet
+    are added."""
+    ch = message.channel
+    if key not in brain._sessions:          # fresh/retired session: start over
+        ctx_seen.pop(key, None)
+    seen = ctx_seen.get(key)
+    ctx_seen[key] = message.id
+    limit = 30 if message.guild is None else 20
+    msgs: list[discord.Message] = []
+    try:
+        async for m in ch.history(limit=limit, before=message, oldest_first=False,
+                                  after=discord.Object(seen) if seen else None):
+            if m.author.bot and client.user and m.author.id != client.user.id and not m.webhook_id:
+                continue
+            msgs.append(m)
+    except (discord.HTTPException, AttributeError):
+        pass
+    msgs.reverse()
+    lines = [l for l in (render_msg(m) for m in msgs) if l]
+    text = "\n".join(lines)[-14000:]
+
+    # Pulse lines link to the original messages — pull those in so the agent
+    # judges what people actually said, not a one-line summary of it.
+    linked: list[str] = []
+    blob = text + " " + (message.reference.resolved.content if message.reference and
+                          isinstance(message.reference.resolved, discord.Message) else "")
+    for cid, mid in list(dict.fromkeys(_JUMP.findall(blob)))[-8:]:
+        src = client.get_channel(int(cid))
+        if src is None:
+            continue
+        try:
+            lm = await src.fetch_message(int(mid))
+        except (discord.HTTPException, AttributeError):
+            continue
+        r = render_msg(lm, 1200)
+        if r:
+            linked.append(f"<{lm.jump_url}> in #{getattr(src, 'name', '?')}: {r}")
+
     ref = message.reference
-    if not (ref and isinstance(ref.resolved, discord.Message)):
-        return question
-    r = ref.resolved
-    if r.author.id == client.user.id:
-        return question
-    return f'(Replying to {r.author.display_name}: "{clip(r.content, 1500)}")\n\n{question}'
+    replied = ""
+    if ref and isinstance(ref.resolved, discord.Message) and ref.resolved.id not in answers \
+            and all(ref.resolved.id != m.id for m in msgs):
+        replied = render_msg(ref.resolved, 3000)
+
+    name = message.author.display_name
+    if message.guild is None:
+        where = (f"a private DM between you and {name}"
+                 + (" — the agentty maintainer and server owner. Your earlier messages "
+                    "here include automatic notifications you sent him (the daily pulse "
+                    "of community chat, GitHub events, joins, feedback)" if is_owner(message.author) else ""))
+    else:
+        where = f"#{getattr(ch, 'name', 'chat')} on the agentty Discord"
+    out = []
+    if text:
+        out.append(f"[Discord context: {where}. Recent messages, oldest first:]\n{text}")
+    elif message.guild is None and is_owner(message.author):
+        out.append(f"[Discord context: {where}.]")
+    if replied:
+        out.append(f"[{name} is replying to this message:]\n{replied}")
+    if linked:
+        out.append("[The Discord messages linked above, verbatim:]\n" + "\n".join(linked))
+
+    # Community memory: free local retrieval over the whole Discord + GitHub
+    # history. Only a few hundred tokens of the most relevant snippets.
+    shown = {f"d:{m.id}" for m in msgs} | {f"d:{message.id}"}
+    probe = " ".join([question, replied, "\n".join(linked), "\n".join(lines[-4:])])
+    hits = memory.search(probe, k=6, exclude=shown)
+    if hits:
+        out.append("[COMMUNITY MEMORY — relevant past Discord/GitHub items:]\n" + render_hits(hits))
+    if out:
+        out.append("[Use the conversation above to resolve references like \"he\", \"that\", "
+                   "\"is it right\" — don't ask for clarification when the answer is in it. "
+                   "If something is a claim about agentty's behaviour, check it in the code "
+                   "and say plainly whether it holds.]")
+        out.append(f"[New message from {name}:]\n{question}")
+        return "\n\n".join(out)
+    return question
+
+
+# ---------------------------------------------------------------------------
+# Model routing — local and free. Cheap model for lookups, smart model for
+# anything that needs judgement. A conversation that went smart stays smart
+# (switching would drop its warm session).
+# ---------------------------------------------------------------------------
+
+_SMART_HINT = re.compile(
+    r"\b(why|bug|broke|broken|crash|error|fail|wrong|right\??|true|correct|should|"
+    r"design|architect|compare|vs|explain|debug|fix|review|regress|slow|leak|"
+    r"is (he|she|it|this|that)|does it|what do you think|opinion|idea|plan|"
+    r"internals?|how does|trade-?off|better|worse)\b", re.I)
+
+
+def pick_model(message: discord.Message, question: str, key: str) -> str:
+    sid = brain._sessions.get(key)
+    if sid and brain._model.get(sid) == ACP_SMART_MODEL:
+        return ACP_SMART_MODEL
+    if is_owner(message.author):
+        return ACP_SMART_MODEL
+    q = question.strip()
+    if len(q) > 220 or "```" in q or _SMART_HINT.search(q) or message.attachments:
+        return ACP_SMART_MODEL
+    if message.reference and isinstance(message.reference.resolved, discord.Message) \
+            and message.reference.resolved.author.id != client.user.id:
+        return ACP_SMART_MODEL          # "@agentty is this right?" on someone's message
+    return ACP_MODEL
+
+
+# ---------------------------------------------------------------------------
+# Memory ingest: Discord (live + backfill) and GitHub (periodic sync)
+# ---------------------------------------------------------------------------
+
+def index_message(m: discord.Message) -> None:
+    if m.guild is None or (m.author.bot and not m.webhook_id):
+        return
+    if client.user and m.author.id == client.user.id:
+        return
+    text = render_msg(m, 4000)
+    if not text or m.webhook_id:          # GitHub feed is indexed from the API
+        return
+    ch = m.channel
+    place = f"{ch.parent.name}/{ch.name}" if isinstance(ch, discord.Thread) and ch.parent else getattr(ch, "name", "?")
+    memory.put(f"d:{m.id}", "discord", place, m.author.display_name,
+               m.created_at.isoformat(timespec="seconds"), m.jump_url, text.split(": ", 1)[-1])
+
+
+def ingest_archive() -> None:
+    """One-time: the JSON archive of channels deleted in the Nov 2026 cleanup."""
+    if memory.meta("archive_done"):
+        return
+    d = Path.home() / "discord-archive-2026-11-27"
+    n = 0
+    for f in d.glob("*.json"):
+        try:
+            data = json.loads(f.read_text())
+        except Exception:
+            continue
+        ch = data.get("channel", {})
+        for m in data.get("messages", []):
+            if m["author"].get("bot") or m.get("webhook_id") or not m.get("content"):
+                continue
+            url = f"https://discord.com/channels/{ch.get('guild_id')}/{ch.get('id')}/{m['id']}"
+            memory.put(f"d:{m['id']}", "discord", ch.get("name", f.stem),
+                       m["author"].get("global_name") or m["author"]["username"],
+                       m["timestamp"][:19] + "+00:00", url, m["content"])
+            n += 1
+    memory.commit()
+    memory.meta("archive_done", str(n))
+    print(f"memory: archive ingested ({n} messages)")
+
+
+async def backfill_discord() -> None:
+    g = client.guild
+    if not g:
+        return
+    total = 0
+    sources: list = list(g.text_channels)
+    for ch in g.text_channels:
+        sources.extend(ch.threads)
+        try:
+            async for t in ch.archived_threads(limit=100):
+                sources.append(t)
+        except discord.HTTPException:
+            pass
+    for src in sources:
+        last = memory.meta(f"last:{src.id}")
+        newest = int(last) if last else 0
+        try:
+            async for m in src.history(limit=None, after=discord.Object(newest) if newest else None,
+                                       oldest_first=True):
+                index_message(m)
+                newest = max(newest, m.id)
+                total += 1
+                if total % 500 == 0:
+                    memory.commit()
+        except discord.HTTPException:
+            continue
+        if newest:
+            memory.meta(f"last:{src.id}", str(newest))
+    memory.commit()
+    print(f"memory: discord backfill +{total} ({memory.count()})")
+
+
+def _iso(s: str | None) -> str:
+    return (s or "")[:19] + "+00:00" if s else ""
+
+
+async def sync_github() -> None:
+    since = memory.meta("gh_since")
+    started = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    q = f"&since={since}" if since else ""
+    n = 0
+    async for it in github.pages(f"/repos/{REPO}/issues?state=all&sort=updated&direction=asc{q}"):
+        pr = "pull_request" in it
+        labels = ", ".join(l["name"] for l in it.get("labels", []))
+        text = (f"{'PR' if pr else 'Issue'} #{it['number']} [{it['state']}] {it['title']}"
+                f"{' (labels: ' + labels + ')' if labels else ''}\n{re.sub(r'<!--.*?-->', '', it.get('body') or '', flags=re.S)}")
+        memory.put(f"gh:{it['number']}", "pr" if pr else "issue", f"#{it['number']}",
+                   it["user"]["login"], _iso(it["created_at"]), it["html_url"], text)
+        n += 1
+    async for c in github.pages(f"/repos/{REPO}/issues/comments?sort=updated&direction=asc{q}"):
+        num = c.get("issue_url", "").rsplit("/", 1)[-1]
+        memory.put(f"ghc:{c['id']}", "issue", f"#{num} comment", c["user"]["login"],
+                   _iso(c["created_at"]), c["html_url"], c.get("body") or "")
+        n += 1
+    async for c in github.pages(f"/repos/{REPO}/commits?{('since=' + since) if since else ''}",
+                                max_pages=10):
+        msg = c["commit"]["message"]
+        memory.put(f"c:{c['sha'][:12]}", "commit", "commit",
+                   (c.get("author") or {}).get("login") or c["commit"]["author"]["name"],
+                   _iso(c["commit"]["author"]["date"]), c["html_url"], msg)
+        n += 1
+    async for r in github.pages(f"/repos/{REPO}/releases", max_pages=3):
+        memory.put(f"r:{r['tag_name']}", "release", r["tag_name"], "release",
+                   _iso(r.get("published_at")), r["html_url"], f"Release {r['tag_name']}\n{r.get('body') or ''}")
+        n += 1
+    memory.commit()
+    memory.meta("gh_since", started)
+    print(f"memory: github sync +{n} ({memory.count()})")
+
+
+async def memory_loop() -> None:
+    try:
+        ingest_archive()
+        await backfill_discord()
+    except Exception as exc:
+        print(f"memory backfill: {exc}")
+    while True:
+        try:
+            await sync_github()
+        except Exception as exc:
+            print(f"memory github sync: {exc}")
+        await asyncio.sleep(1800)
 
 
 # ---------------------------------------------------------------------------
@@ -536,11 +789,15 @@ async def handle_help_post(message: discord.Message) -> None:
         thread = None
     if thread:
         help_askers[thread.id] = message.author.id
-        await stream_answer(message.content, channel=thread, reply_to=None,
-                            key=f"t{thread.id}", author=message.author)
+        key = f"t{thread.id}"
+        q = await with_context(message, message.content, key)
+        await stream_answer(q, channel=thread, reply_to=None, key=key, author=message.author,
+                            model=pick_model(message, message.content, key))
     else:
-        await stream_answer(message.content, channel=message.channel, reply_to=message,
-                            key=f"m{message.id}", author=message.author)
+        key = f"m{message.id}"
+        q = await with_context(message, message.content, key)
+        await stream_answer(q, channel=message.channel, reply_to=message, key=key,
+                            author=message.author, model=pick_model(message, message.content, key))
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +1038,7 @@ async def run_pulse(hours: float) -> str:
         return f"\U0001f319 Quiet night — no human messages in the last {hours:g}h."
     key = f"pulse{int(time.time())}"
     try:
-        out = await brain.ask(PULSE_PROMPT + text, convo_key=key)
+        out = await brain.ask(PULSE_PROMPT + text, convo_key=key, model=ACP_SMART_MODEL)
     finally:
         try:
             brain.reset(key)
@@ -834,7 +1091,7 @@ async def on_ready() -> None:
             pass
     print(f"agentty-bot online as {client.user} (guild: {g and g.name}, owner: {client.owner_id})")
     await set_presence()
-    for coro in (release_loop(), stars_loop(), daily_pulse_loop()):
+    for coro in (release_loop(), stars_loop(), daily_pulse_loop(), memory_loop()):
         asyncio.create_task(coro)
     try:
         await brain._ensure_started()
@@ -928,6 +1185,8 @@ async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
 
+    index_message(message)
+
     # A newcomer's first words → owner DM.
     if message.guild and message.author.id in state.get("fresh", []):
         state.set("fresh", [i for i in state.get("fresh", []) if i != message.author.id])
@@ -956,8 +1215,11 @@ async def on_message(message: discord.Message) -> None:
         if ch.id in help_handoff:
             return
         if question:
-            await stream_answer(question, channel=ch, reply_to=message, key=f"t{ch.id}",
-                                author=message.author)
+            key = f"t{ch.id}"
+            model = pick_model(message, question, key)
+            q = await with_context(message, question, key)
+            await stream_answer(q, channel=ch, reply_to=message, key=key,
+                                author=message.author, model=model)
         return
 
     if is_dm or mentioned or replying_to_bot:
@@ -971,9 +1233,11 @@ async def on_message(message: discord.Message) -> None:
             return
         if message.attachments:
             question += "\n\n(Attached: " + ", ".join(a.filename for a in message.attachments[:5]) + ")"
-        question = await with_reply_context(message, question)
-        await stream_answer(question, channel=ch, reply_to=message, key=convo_key_for(message),
-                            author=message.author)
+        key = convo_key_for(message)
+        model = pick_model(message, question, key)
+        question = await with_context(message, question, key)
+        await stream_answer(question, channel=ch, reply_to=message, key=key,
+                            author=message.author, model=model)
         return
 
     # Everyone else's chat: just unfurl #123 refs.

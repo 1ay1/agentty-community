@@ -5,3 +5,5 @@ __pycache__/
 *.pyc
 state.json
 state.tmp
+memory.db
+memory.db-*

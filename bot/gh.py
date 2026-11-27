@@ -127,6 +127,18 @@ class GitHub:
         if self._session and not self._session.closed:
             await self._session.close()
 
+    async def pages(self, path: str, max_pages: int = 30):
+        """Yield items from a paged list endpoint (per_page=100)."""
+        sep = "&" if "?" in path else "?"
+        for page in range(1, max_pages + 1):
+            items = await self.get(f"{path}{sep}per_page=100&page={page}")
+            if not items:
+                return
+            for it in items:
+                yield it
+            if len(items) < 100:
+                return
+
 
 async def _selftest() -> None:
     g = GitHub()

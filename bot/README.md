@@ -22,6 +22,15 @@ The bot finds channels **by name**, so keep the names above if you rename things
 ## What the bot does
 
 **For everyone**
+- **It knows the room.** Every question carries the recent conversation, the
+  messages it replies to or links, and **community memory**: a local SQLite
+  FTS5 index (`memory.db`) of every Discord message (including the archived
+  channels) plus all GitHub issues, PRs, comments, commits and releases.
+  Retrieval is local and free, and only the ~6 most relevant snippets are sent.
+- **Two brains.** Simple lookups go to `ACP_MODEL` (Haiku). Anything that needs
+  judgement goes to `ACP_SMART_MODEL` (Sonnet): bugs, "is he right?", design,
+  long questions, and anything from the owner. A conversation stays on the model
+  it started with, so its prompt cache stays warm.
 - **Ask**: @mention, reply, DM, or `/ask`. The answer streams in live, with a
   line showing what the agent is reading. Replying to an answer continues the
   conversation (with memory). Every answer has 👍/👎 buttons.
