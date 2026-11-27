@@ -743,6 +743,7 @@ PULSE_PROMPT = (
     "what, link), **\U0001f4a1 Requests & ideas**, **\U0001f615 Confusion / docs "
     "gaps**, **\U0001f64c Praise**, **\u23f0 Needs your reply** (unanswered "
     "questions, with links). Be concrete, name people, keep it under 350 words. "
+    "Link messages as [→](url), never by their numeric id. "
     "If nothing meaningful happened, say so in one line.\n\nTRANSCRIPT:\n"
 )
 
